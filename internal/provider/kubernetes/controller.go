@@ -163,11 +163,18 @@ func (r *gatewayAPIReconciler) Reconcile(ctx context.Context, request reconcile.
 }
 
 func (r *gatewayAPIReconciler) scheduleRun() {
-	timer := time.NewTimer(r.interval)
+	t := time.NewTimer(r.interval)
 	for {
 		<-r.runC
 		r.run(context.Background())
-		<-timer.C
+		if !t.Stop() {
+			select {
+			case <-t.C:
+			default:
+			}
+		}
+		t.Reset(r.interval)
+		<-t.C
 	}
 }
 
