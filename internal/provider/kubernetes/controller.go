@@ -8,6 +8,7 @@ package kubernetes
 import (
 	"context"
 	"fmt"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -71,6 +72,8 @@ type gatewayAPIReconciler struct {
 	resources                *message.ProviderResources
 	envoyPatchPolicyStatuses *message.EnvoyPatchPolicyStatuses
 	extGVKs                  []schema.GroupVersionKind
+	runC                     chan struct{}
+	interval                 time.Duration
 }
 
 // newGatewayAPIController
@@ -98,6 +101,8 @@ func newGatewayAPIController(mgr manager.Manager, cfg *config.Server, su status.
 		extGVKs:                  extGVKs,
 		store:                    newProviderStore(),
 		envoyGateway:             cfg.EnvoyGateway,
+		runC:                     make(chan struct{}, 1),
+		interval:                 time.Second * 5,
 	}
 
 	c, err := controller.New("gatewayapi", mgr, controller.Options{Reconciler: r})
@@ -113,6 +118,7 @@ func newGatewayAPIController(mgr manager.Manager, cfg *config.Server, su status.
 	if err := r.watchResources(ctx, mgr, c); err != nil {
 		return err
 	}
+	go r.scheduleRun()
 	return nil
 }
 
@@ -148,10 +154,27 @@ func newResourceMapping() *resourceMappings {
 
 func (r *gatewayAPIReconciler) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
 	r.log.WithName(request.Name).Info("reconciling object", "namespace", request.Namespace, "name", request.Name)
+	select {
+	case r.runC <- struct{}{}:
+	default:
+	}
+	r.log.WithName(request.Name).Info("reconciled gatewayAPI object successfully", "namespace", request.Namespace, "name", request.Name)
+	return reconcile.Result{}, nil
+}
 
+func (r *gatewayAPIReconciler) scheduleRun() {
+	timer := time.NewTimer(r.interval)
+	for {
+		<-r.runC
+		r.run(context.Background())
+		<-timer.C
+	}
+}
+
+func (r *gatewayAPIReconciler) run(ctx context.Context) error {
 	var gatewayClasses gwapiv1b1.GatewayClassList
 	if err := r.client.List(ctx, &gatewayClasses); err != nil {
-		return reconcile.Result{}, fmt.Errorf("error listing gatewayclasses: %v", err)
+		return fmt.Errorf("error listing gatewayclasses: %v", err)
 	}
 
 	var cc controlledClasses
@@ -179,7 +202,7 @@ func (r *gatewayAPIReconciler) Reconcile(ctx context.Context, request reconcile.
 	acceptedGC := cc.acceptedClass()
 	if acceptedGC == nil {
 		r.log.Info("no accepted gatewayclass")
-		return reconcile.Result{}, nil
+		return nil
 	}
 
 	// Update status for all gateway classes
@@ -187,7 +210,7 @@ func (r *gatewayAPIReconciler) Reconcile(ctx context.Context, request reconcile.
 		if err := r.gatewayClassUpdater(ctx, gc, false, string(status.ReasonOlderGatewayClassExists),
 			status.MsgOlderGatewayClassExists); err != nil {
 			r.resources.GatewayAPIResources.Delete(acceptedGC.Name)
-			return reconcile.Result{}, err
+			return err
 		}
 	}
 
@@ -196,7 +219,7 @@ func (r *gatewayAPIReconciler) Reconcile(ctx context.Context, request reconcile.
 	resourceMap := newResourceMapping()
 
 	if err := r.processGateways(ctx, acceptedGC, resourceMap, resourceTree); err != nil {
-		return reconcile.Result{}, err
+		return err
 	}
 
 	for serviceNamespaceName := range resourceMap.allAssociatedBackendRefs {
@@ -245,7 +268,7 @@ func (r *gatewayAPIReconciler) Reconcile(ctx context.Context, request reconcile.
 	if r.envoyGateway.ExtensionAPIs != nil && r.envoyGateway.ExtensionAPIs.EnableEnvoyPatchPolicy {
 		envoyPatchPolicies := egv1a1.EnvoyPatchPolicyList{}
 		if err := r.client.List(ctx, &envoyPatchPolicies); err != nil {
-			return reconcile.Result{}, fmt.Errorf("error listing envoypatchpolicies: %v", err)
+			return fmt.Errorf("error listing envoypatchpolicies: %v", err)
 		}
 
 		for _, policy := range envoyPatchPolicies.Items {
@@ -264,9 +287,9 @@ func (r *gatewayAPIReconciler) Reconcile(ctx context.Context, request reconcile.
 		if err != nil {
 			r.log.Error(err, "unable to find the namespace")
 			if kerrors.IsNotFound(err) {
-				return reconcile.Result{}, nil
+				return nil
 			}
-			return reconcile.Result{}, err
+			return err
 		}
 
 		resourceTree.Namespaces = append(resourceTree.Namespaces, namespace)
@@ -280,13 +303,13 @@ func (r *gatewayAPIReconciler) Reconcile(ctx context.Context, request reconcile.
 				r.log.Error(err, "unable to update GatewayClass status")
 			}
 			r.log.Error(err, "failed to process parametersRef for gatewayclass", "name", acceptedGC.Name)
-			return reconcile.Result{}, err
+			return err
 		}
 	}
 
 	if err := r.gatewayClassUpdater(ctx, acceptedGC, true, string(gwapiv1b1.GatewayClassReasonAccepted), status.MsgValidGatewayClass); err != nil {
 		r.log.Error(err, "unable to update GatewayClass status")
-		return reconcile.Result{}, err
+		return err
 	}
 
 	// Update finalizer on the gateway class based on the resource tree.
@@ -297,14 +320,14 @@ func (r *gatewayAPIReconciler) Reconcile(ctx context.Context, request reconcile.
 		if err := r.removeFinalizer(ctx, acceptedGC); err != nil {
 			r.log.Error(err, fmt.Sprintf("failed to remove finalizer from gatewayclass %s",
 				acceptedGC.Name))
-			return reconcile.Result{}, err
+			return err
 		}
 	} else {
 		// finalize the accepted GatewayClass.
 		if err := r.addFinalizer(ctx, acceptedGC); err != nil {
 			r.log.Error(err, fmt.Sprintf("failed adding finalizer to gatewayclass %s",
 				acceptedGC.Name))
-			return reconcile.Result{}, err
+			return err
 		}
 	}
 
@@ -313,8 +336,7 @@ func (r *gatewayAPIReconciler) Reconcile(ctx context.Context, request reconcile.
 	// Store will be required to trigger a cleanup of envoy infra resources.
 	r.resources.GatewayAPIResources.Store(acceptedGC.Name, resourceTree)
 
-	r.log.WithName(request.Name).Info("reconciled gatewayAPI object successfully", "namespace", request.Namespace, "name", request.Name)
-	return reconcile.Result{}, nil
+	return nil
 }
 
 func (r *gatewayAPIReconciler) gatewayClassUpdater(ctx context.Context, gc *gwapiv1b1.GatewayClass, accepted bool, reason, msg string) error {
